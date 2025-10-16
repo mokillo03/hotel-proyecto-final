@@ -4,6 +4,11 @@ const router = express.Router();
 const Habitacion = require('../models/Habitacion');
 const Reserva = require('../models/Reserva');
 const { verifyToken } = require('../middlewares/authMiddlewares'); 
+//pagos
+
+const { Preference } = require('mercadopago');
+const mpClient = require('../config/mp.config');
+const preferencesService = new Preference(mpClient);
 
 // ------------------------------------------------------------------------
 // A. RUTAS PÚBLICAS (No requieren token)
@@ -32,17 +37,13 @@ router.get('/habitaciones', async (req, res) => {
 // ------------------------------------------------------------------------
 
 // 2. Realizar reserva (POST /api/user/reservas)
+// 2. Realizar reserva y crear preferencia de pago (POST /api/user/reservas)
 router.post('/reservas', verifyToken, async (req, res) => {
     try {
-        const { habitacion_id, fecha_entrada, fecha_salida, huespedes, total_pagar, metodo_pago } = req.body;
-        
-        // El ID del usuario que hace la reserva viene del token
+        const { habitacion_id, fecha_entrada, fecha_salida, huespedes, total_pagar } = req.body;
         const usuario_id = req.usuario.id; 
         
-        // Lógica de validación (simplificada): 
-        // En un sistema real, aquí iría una validación compleja de cruce de fechas 
-        // y disponibilidad, pero por ahora solo verificamos el ID.
-        
+        // 1. Crear la reserva en DB con estado 'Pendiente'
         const nuevaReserva = await Reserva.create({
             usuario_id,
             habitacion_id,
@@ -50,18 +51,42 @@ router.post('/reservas', verifyToken, async (req, res) => {
             fecha_salida,
             huespedes,
             total_pagar,
-            metodo_pago,
-            estado: 'Pendiente' // Se confirma/paga después
+            metodo_pago: 'Mercado Pago',
+            estado: 'Pendiente' // Se confirma después de la notificación
+        });
+        
+        // 2. Crear la preferencia de pago en Mercado Pago
+        const preference = {
+            items: [
+                {
+                    title: `Reserva Habitación #${habitacion_id}`,
+                    unit_price: Number(total_pagar),
+                    quantity: 1,
+                }
+            ],
+            // Rutas de respuesta para Mercado Pago (cambiar al dominio de despliegue)
+            back_urls: {
+                success: "https://tudominio.com/reserva/feedback/success", // URL de tu frontend
+                failure: "https://tudominio.com/reserva/feedback/failure",
+                pending: "https://tudominio.com/reserva/feedback/pending",
+            },
+            // IMPORTANTE: Metadatos para identificar la reserva cuando MP nos notifique
+            external_reference: nuevaReserva.id.toString(), 
+            auto_return: 'approved',
+        };
+
+        const mp_response = await preferencesService.create({ body: preference });
+        
+        // 3. Responder al frontend con el link de pago
+        res.status(201).json({ 
+            msg: 'Reserva pendiente. Redirigir al pago.', 
+            reserva_id: nuevaReserva.id,
+            init_point: mp_response.init_point // URL para redireccionar al usuario a pagar
         });
 
-        // Actualizar estado de la habitación (Asumimos que la habitación se marca Ocupada por la reserva)
-        await Habitacion.update({ estado: 'Ocupada' }, { where: { id: habitacion_id } });
-
-        res.status(201).json({ msg: 'Reserva creada exitosamente', reserva: nuevaReserva });
-
     } catch (error) {
-        console.error('Error al realizar reserva:', error);
-        res.status(500).json({ msg: 'Error del servidor al crear reserva.', error });
+        console.error('Error al crear preferencia de pago:', error);
+        res.status(500).json({ msg: 'Error en el checkout.', error: error.message });
     }
 });
 
@@ -85,6 +110,43 @@ router.post('/consultas', async (req, res) => {
 
     } catch (error) {
         res.status(500).json({ msg: 'Error al enviar consulta', error });
+    }
+});
+
+// RUTA PÚBLICA: Mercado Pago nos notifica el pago
+// POST /api/user/notificaciones/mp
+router.post('/notificaciones/mp', async (req, res) => {
+    try {
+        const { topic, id } = req.query; // MP envía los datos como query params
+        
+        if (topic === 'payment') {
+            const payment_info = await mpClient.payment.get({ id });
+            const { external_reference, status } = payment_info.body;
+            const reservaId = external_reference;
+
+            if (status === 'approved') {
+                // El pago fue aprobado: ¡CONFIRMAR LA RESERVA EN DB!
+                await Reserva.update(
+                    { estado: 'Confirmada', metodo_pago: 'Mercado Pago Aprobado' },
+                    { where: { id: reservaId } }
+                );
+
+                // Opcional: Actualizar el estado de la Habitación a 'Ocupada/Confirmada'
+            } else if (status === 'rejected' || status === 'cancelled') {
+                // El pago falló: Marcar reserva como Cancelada
+                await Reserva.update(
+                    { estado: 'Cancelada' },
+                    { where: { id: reservaId } }
+                );
+            }
+        }
+        
+        // Siempre debe responder 200 OK para que MP sepa que recibimos la notificación
+        res.status(200).send('OK'); 
+
+    } catch (error) {
+        console.error('Error procesando notificación MP:', error);
+        res.status(500).send('Error');
     }
 });
 
