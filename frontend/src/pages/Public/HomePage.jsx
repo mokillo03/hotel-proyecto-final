@@ -11,7 +11,7 @@ const HomePage = () => {
           Bienvenido al Hotel Management System
         </Typography>
         <Typography variant="h6" color="text.secondary">
-          Tu puerta de entrada a la gestión de habitaciones y reservas.
+          Tu puerta de entrada a la gestión de habitaciones y reservas de down uwu ñya.
         </Typography>
         <Box sx={{ mt: 5 }}>
             <Typography variant="body1">
