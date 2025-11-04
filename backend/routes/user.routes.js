@@ -117,36 +117,54 @@ router.post('/consultas', async (req, res) => {
 // POST /api/user/notificaciones/mp
 router.post('/notificaciones/mp', async (req, res) => {
     try {
-        const { topic, id } = req.query; // MP envía los datos como query params
+        const { topic, id: notificationId } = req.query; 
+
+        // 1. Log inicial para confirmar que el código se ejecuta
+        console.log('--- Webhook de Mercado Pago Recibido ---');
+        console.log('Topic:', topic, '| ID de Notificación (Query):', notificationId);
+        console.log('Cuerpo de la Solicitud (req.body):', req.body);
         
-        if (topic === 'payment') {
-            const payment_info = await mpClient.payment.get({ id });
-            const { external_reference, status } = payment_info.body;
-            const reservaId = external_reference;
+        if (topic !== 'payment') {
+            console.log('Notificación ignorada: No es un evento de pago.');
+            return res.status(200).send('OK'); // Responder y salir si no es pago
+        }
 
-            if (status === 'approved') {
-                // El pago fue aprobado: ¡CONFIRMAR LA RESERVA EN DB!
-                await Reserva.update(
-                    { estado: 'Confirmada', metodo_pago: 'Mercado Pago Aprobado' },
-                    { where: { id: reservaId } }
-                );
+        // 2. Consultar el pago a la API de MP
+        // Aquí suele fallar si el 'id' no es el esperado
+        const paymentResponse = await mpClient.payment.get({ id: notificationId });
+        
+        const paymentData = paymentResponse.body || paymentResponse; 
+        const externalReference = paymentData.external_reference;
+        const status = paymentData.status; 
+        const reservaId = externalReference;
 
-                // Opcional: Actualizar el estado de la Habitación a 'Ocupada/Confirmada'
-            } else if (status === 'rejected' || status === 'cancelled') {
-                // El pago falló: Marcar reserva como Cancelada
-                await Reserva.update(
-                    { estado: 'Cancelada' },
-                    { where: { id: reservaId } }
-                );
+        console.log(`PAGO EXITOSO (MP) | Status Recibido: ${status} | Reserva ID: ${reservaId}`);
+
+        // 3. Lógica de actualización de estado
+        if (status === 'approved') {
+            const [updatedRows] = await Reserva.update(
+                { estado: 'Confirmada', metodo_pago: 'Mercado Pago Aprobado' },
+                { where: { id: reservaId, estado: 'Pendiente' } } // Solo actualizar si está Pendiente
+            );
+            
+            if (updatedRows > 0) {
+                console.log(`✅ RESERVA ${reservaId} ACTUALIZADA a CONFIRMADA.`);
+            } else {
+                 console.log(`⚠️ Reserva ${reservaId} ya estaba Confirmada o no existe.`);
             }
+        } else {
+             // Lógica de cancelación
+             console.log(`Pago no aprobado. Status: ${status}`);
         }
         
-        // Siempre debe responder 200 OK para que MP sepa que recibimos la notificación
+        // 4. Responder 200 OK solo si el procesamiento no arrojó un error
         res.status(200).send('OK'); 
 
     } catch (error) {
-        console.error('Error procesando notificación MP:', error);
-        res.status(500).send('Error');
+        // MUY IMPORTANTE: Logear el error completo si la lógica falla
+        console.error('❌ ERROR CRÍTICO al procesar Webhook:', error.message);
+        // Responder con 200 OK para que MP no siga reintentando (aunque hubo fallo interno)
+        res.status(200).send('ERROR LOGEADO');
     }
 });
 
